@@ -1,6 +1,10 @@
 #include "json_parser.h"
 
 #include <cctype>
+#include <future>
+#include <list>
+#include <mutex>
+#include <atomic>
 
 #include "json_value.h"
 #include "json_object.h"
@@ -220,7 +224,30 @@ json::value json::parser::parse_array(
         return array();
     }
 
-    array result;
+    std::list<value> valuelist;
+    std::mutex mutex;
+    std::atomic<bool> produce_finished = false;
+
+    auto emplace_foo = [&]()
+        -> decltype(auto) {
+        array result;
+
+        while (!produce_finished)
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (valuelist.empty())
+            {
+                continue;
+            }
+            result.emplace_back(std::move(valuelist.front()));
+            valuelist.pop_front();
+        }
+        return result;
+    };
+    // 消费者线程
+    auto future = std::async(std::launch::async, emplace_foo);
+
+    // 主线程作为生产者
     while (true)
     {
         if (!skip_whitespace(content, cur))
@@ -235,7 +262,9 @@ json::value json::parser::parse_array(
             return value::invalid_value();
         }
 
-        result.emplace_back(std::move(val));
+        std::unique_lock<std::mutex> lock(mutex);
+        valuelist.emplace_back(std::move(val));
+        lock.unlock();
 
         if (*cur == ',')
         {
@@ -246,6 +275,7 @@ json::value json::parser::parse_array(
             break;
         }
     }
+    produce_finished = true;
 
     if (skip_whitespace(content, cur) && *cur == ']')
     {
@@ -256,7 +286,7 @@ json::value json::parser::parse_array(
         return value::invalid_value();
     }
 
-    return result;
+    return future.get();
 }
 
 json::value json::parser::parse_object(
